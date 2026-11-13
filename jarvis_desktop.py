@@ -10,6 +10,8 @@
 import asyncio
 import base64
 import ctypes
+import datetime
+import difflib
 import io
 import json
 import os
@@ -21,6 +23,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import messagebox, scrolledtext
 
@@ -36,21 +39,33 @@ BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__
 load_dotenv(BASE / ".env")
 
 
+HAS_KEY = False
+
+
 def ensure_key():
-    """При первом запуске спрашиваем API-ключ в окошке и сохраняем в .env рядом с программой."""
+    """Есть ключ — полный режим с ИИ. Нет — режим без ключа: макросы и простые команды."""
+    global HAS_KEY
     if os.getenv("ANTHROPIC_API_KEY"):
+        HAS_KEY = True
+        return
+    if (BASE / ".no_key").exists():  # раньше нажали «Отмена» — больше не спрашиваем
         return
     from tkinter import simpledialog
     r = tk.Tk()
     r.withdraw()
-    key = simpledialog.askstring("Jarvis — первый запуск", "Вставь Anthropic API key (sk-ant-...):", show="*", parent=r)
+    key = simpledialog.askstring(
+        "Jarvis — первый запуск",
+        "Вставь Anthropic API key (sk-ant-...).\n\nНет ключа? Нажми «Отмена» — Jarvis будет работать\n"
+        "без ИИ: макросы (игровой режим и т.п.) и простые команды.", show="*", parent=r)
     r.destroy()
-    if not key or not key.strip():
-        sys.exit(1)
-    key = key.strip()
-    with open(BASE / ".env", "a", encoding="utf-8") as f:
-        f.write(f"\nANTHROPIC_API_KEY={key}\n")
-    os.environ["ANTHROPIC_API_KEY"] = key
+    if key and key.strip():
+        key = key.strip()
+        with open(BASE / ".env", "a", encoding="utf-8") as f:
+            f.write(f"\nANTHROPIC_API_KEY={key}\n")
+        os.environ["ANTHROPIC_API_KEY"] = key
+        HAS_KEY = True
+    else:
+        (BASE / ".no_key").write_text("1", encoding="utf-8")
 
 
 ensure_key()
@@ -74,7 +89,7 @@ except Exception:
 pyautogui.FAILSAFE = True  # мышь в угол экрана — аварийная остановка
 pyautogui.PAUSE = 0.1
 
-claude = Anthropic()  # ANTHROPIC_API_KEY из окружения
+claude = Anthropic() if HAS_KEY else None  # ANTHROPIC_API_KEY из окружения
 cancel = threading.Event()
 speaking = threading.Event()
 jobs: "queue.Queue[str]" = queue.Queue()
@@ -255,11 +270,62 @@ def load_macros() -> dict:
         return {}
 
 
+def _norm(s: str) -> str:
+    return re.sub(r"[^\w\s]", " ", s.lower()).strip()
+
+
 def match_macro(cmd: str) -> str | None:
-    low = cmd.lower()
-    for name, m in load_macros().items():
-        if any(a.lower() in low for a in [name, *m.get("aliases", [])]):
+    """Мини-мозг без моделей: прямое совпадение, затем нечёткое сравнение слов (опечатки, ошибки распознавания)."""
+    macros = load_macros()
+    low = _norm(cmd)
+    for name, m in macros.items():
+        if any(p and p in low for p in (_norm(a) for a in [name, *m.get("aliases", [])])):
             return name
+    words = low.split()
+    best, best_score = None, 0.0
+    for name, m in macros.items():
+        for ph in [name, *m.get("aliases", []), *m.get("examples", [])]:
+            p = _norm(ph)
+            if not p:
+                continue
+            pw = p.split()
+            hits = sum(1 for w in pw if difflib.get_close_matches(w, words, n=1, cutoff=0.8))
+            score = max(difflib.SequenceMatcher(None, low, p).ratio(), hits / len(pw))
+            if score > best_score:
+                best, best_score = name, score
+    return best if best_score >= 0.8 else None
+
+
+SITES = {"ютуб": "youtube.com", "youtube": "youtube.com", "гугл": "google.com", "google": "google.com",
+         "гитхаб": "github.com", "github": "github.com", "вк": "vk.com", "вконтакте": "vk.com",
+         "телеграм": "web.telegram.org", "дискорд": "discord.com/app", "твич": "twitch.tv"}
+
+
+def local_command(cmd: str) -> str | None:
+    """Простые команды без ИИ."""
+    low = _norm(cmd)
+    if re.search(r"что ты умеешь|помощь|список команд", low):
+        names = ", ".join(load_macros()) or "макросов нет"
+        return f"Сэр, я знаю макросы: {names}. А ещё время, дату, «открой ютуб», «открой блокнот» и скриншот."
+    if re.search(r"который час|сколько времени|скажи время", low):
+        return "Сэр, сейчас " + datetime.datetime.now().strftime("%H:%M") + "."
+    if re.search(r"какое число|какая дата|какой сегодня день", low):
+        return "Сэр, сегодня " + datetime.date.today().strftime("%d.%m.%Y") + "."
+    if "скриншот" in low:
+        folder = Path.home() / "Pictures"
+        folder.mkdir(exist_ok=True)
+        path = folder / f"jarvis_{datetime.datetime.now():%Y%m%d_%H%M%S}.png"
+        pyautogui.screenshot().save(path)
+        return f"Скриншот сохранён, сэр: {path.name}."
+    m = re.match(r"(открой|запусти|включи)\s+(.+)", low)
+    if m:
+        target = m.group(2).strip()
+        if target in SITES:
+            webbrowser.open("https://" + SITES[target])
+            return f"Открываю {target}, сэр."
+        if os.name == "nt" and re.fullmatch(r"[\w.\- ]{1,40}", target):
+            subprocess.Popen(f'start "" "{target}"', shell=True)
+            return f"Пробую открыть {target}, сэр."
     return None
 
 
@@ -424,7 +490,13 @@ def worker():
         app.log(f"Ты: {cmd}")
         try:
             macro = match_macro(cmd)
-            reply = run_macro(macro) if macro else run_agent(cmd)
+            if macro:
+                reply = run_macro(macro)
+            elif HAS_KEY:
+                reply = local_command(cmd) or run_agent(cmd)
+            else:
+                reply = local_command(cmd) or ("Сэр, без ИИ я знаю только макросы и простые команды. "
+                                               "Скажи «что ты умеешь» или добавь ключ.")
         except Exception as e:
             reply = f"Сэр, ошибка: {e}"
         app.log(f"Jarvis: {reply}")
