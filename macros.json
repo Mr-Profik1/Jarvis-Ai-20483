@@ -1,0 +1,17 @@
+{
+  "игровой режим": {
+    "aliases": ["game mode", "gaming mode", "режим игры", "включи игры"],
+    "commands": [
+      "powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
+      "start \"\" steam://open/main"
+    ],
+    "say": "игровой режим включён"
+  },
+  "обычный режим": {
+    "aliases": ["normal mode", "выключи игровой режим", "отбой"],
+    "commands": [
+      "powercfg /setactive 381b4222-f694-41f0-9685-ff5bb260df2e"
+    ],
+    "say": "обычный режим включён"
+  }
+}
